@@ -68,7 +68,11 @@ load_dotenv()
 
 DEFAULT_CAPITAL       = float(os.getenv("DEFAULT_CAPITAL", "1000.0"))
 MAX_POSITION_PCT      = float(os.getenv("MAX_POSITION_PCT", "10.0"))   # % of equity per trade
-BINANCE_WS_URL        = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+# Use BINANCE_PROXY_URL (relay) when direct Binance access is blocked.
+_BINANCE_PROXY        = os.getenv("BINANCE_PROXY_URL", "").rstrip("/")
+BINANCE_WS_URL        = (_BINANCE_PROXY + "?streams=btcusdt@trade"
+                         if _BINANCE_PROXY
+                         else "wss://stream.binance.com:9443/ws/btcusdt@trade")
 EQUITY_SNAPSHOT_EVERY = int(os.getenv("EQUITY_SNAPSHOT_EVERY", "10"))  # heartbeats
 HEARTBEAT_INTERVAL    = int(os.getenv("HEARTBEAT_INTERVAL", "5"))       # seconds
 LOG_ARCHIVE_LEVELS    = {"TRADE", "ERROR", "WARN", "PNL"}
@@ -203,65 +207,185 @@ def loguru_ws_sink(message):
         pass
 
 
-# ── Binance Price Feed ─────────────────────────────────────────────────────
+# ── Price tick helper ──────────────────────────────────────────────────
 
-async def binance_price_feed():
-    """Live BTC price from Binance public WS. Auto-reconnect with exponential backoff."""
+async def _apply_price_tick(price: float):
+    """Apply a new BTC price to account state and broadcast to dashboards."""
+    now = time.time()
+    market.btc_price       = price
+    market.feed_latency_ms = int((now - market.last_tick_ts) * 1000)
+    market.last_tick_ts    = now
+
+    account.update_unrealized(price)
+
+    # Persist PnL updates periodically; never crash the feed loop on DB error.
+    if int(now) % 10 == 0 and account.positions:
+        try:
+            for pos in list(account.positions.values()):
+                update_position_pnl(pos.id, pos.unrealized_pnl, pos.roi_pct)
+        except Exception as _db_err:
+            logger.debug(f"pnl persist skipped: {_db_err}")
+
+    await manager.broadcast({
+        "type":           "price",
+        "price":          price,
+        "unrealized_pnl": account.unrealized_pnl,
+        "equity":         round(account.equity, 2),
+        "drawdown_pct":   account.drawdown_pct,
+        "exposure":       round(account.exposure, 2),
+    })
+
+
+# ── Binance primary WS feed ───────────────────────────────────────────
+
+async def _binance_ws_feed():
+    """
+    Primary feed: Binance public trade stream (no API key).
+    Raises ConnectionError after 3 consecutive failures so the orchestrator
+    can hand off to the REST fallback.
+    """
     global market
     backoff = 1
+    failed_attempts = 0
     while True:
         try:
-            t0 = time.time()
             async with websockets.connect(
                 BINANCE_WS_URL,
                 ping_interval=20,
                 ping_timeout=10,
                 close_timeout=5,
+                open_timeout=8,
             ) as ws:
                 market.feed_connected = True
                 market.last_tick_ts   = time.time()
-                backoff = 1  # reset on successful connect
-                logger.info("price feed connected  BTCUSDT@trade")
+                backoff         = 1
+                failed_attempts = 0
+                logger.info("price feed connected  BTCUSDT@trade [binance]")
                 await manager.broadcast({"type": "state", "data": _full_state_dict()})
 
                 async for raw in ws:
-                    tick = json.loads(raw)
+                    tick  = json.loads(raw)
                     price = float(tick["p"])
-                    now   = time.time()
-                    market.btc_price        = price
-                    market.feed_latency_ms  = int((now - market.last_tick_ts) * 1000)
-                    market.last_tick_ts     = now
-
-                    # Update all open position unrealized PnL
-                    account.update_unrealized(price)
-
-                    # BUG-9 FIX: persist PnL updates with error boundary
-                    # A DB exception must NEVER crash the price feed loop
-                    if int(now) % 10 == 0 and account.positions:
-                        try:
-                            for pos in list(account.positions.values()):
-                                update_position_pnl(pos.id, pos.unrealized_pnl, pos.roi_pct)
-                        except Exception as _db_err:
-                            logger.debug(f"pnl persist skipped: {_db_err}")
-
-                    await manager.broadcast({
-                        "type":          "price",
-                        "price":         price,
-                        "unrealized_pnl": account.unrealized_pnl,
-                        "equity":        round(account.equity, 2),
-                        "drawdown_pct":  account.drawdown_pct,
-                        "exposure":      round(account.exposure, 2),
-                    })
+                    await _apply_price_tick(price)
 
         except asyncio.CancelledError:
-            break
+            raise
         except Exception as e:
             market.feed_connected = False
-            logger.warning(f"price feed lost: {e}  reconnecting in {backoff}s")
+            failed_attempts += 1
+            logger.warning(f"binance feed lost: {e}  retry in {backoff}s")
             await manager.broadcast({"type": "state", "data": _full_state_dict()})
+            if failed_attempts >= 3:
+                raise ConnectionError(f"binance unreachable after {failed_attempts} attempts")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
+
+# ── CoinGecko / fallback REST polling feed ──────────────────────────────
+
+_COINGECKO_URL   = ("https://api.coingecko.com/api/v3/simple/price"
+                    "?ids=bitcoin&vs_currencies=usd")
+_COINPAPRIKA_URL = "https://api.coinpaprika.com/v1/tickers/btc-bitcoin?quotes=USD"
+FALLBACK_POLL_INTERVAL        = float(os.getenv("FALLBACK_POLL_INTERVAL", "10"))  # seconds
+_FALLBACK_BINANCE_RETRY_EVERY = int(os.getenv("FALLBACK_BINANCE_RETRY_EVERY", "30"))
+
+
+async def _fetch_rest(url: str, extract_fn) -> float:
+    """Run a blocking REST call in a thread executor."""
+    import urllib.request
+    loop = asyncio.get_event_loop()
+    def _get():
+        req = urllib.request.Request(url, headers={"User-Agent": "poly-trading-engine/3"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return extract_fn(json.loads(r.read()))
+    return await loop.run_in_executor(None, _get)
+
+
+async def _fallback_poll_feed():
+    """
+    Secondary feed: REST polling (CoinGecko -> CoinPaprika).
+    Activated when Binance WS is unreachable.
+    Retries Binance every _FALLBACK_BINANCE_RETRY_EVERY polls and hands back
+    to _binance_ws_feed once Binance becomes reachable again.
+    """
+    global market
+    poll_count = 0
+    logger.warning("switching to REST fallback feed (CoinGecko/CoinPaprika)")
+    await manager.broadcast({"type": "log", "entry": {
+        "ts": datetime.now().strftime("%H:%M:%S"), "level": "WARN",
+        "mod": "feed", "msg": "Binance blocked - using REST fallback (CoinGecko)",
+    }})
+
+    while True:
+        poll_count += 1
+
+        # Periodically retry Binance primary feed.
+        if poll_count % _FALLBACK_BINANCE_RETRY_EVERY == 0:
+            logger.info("fallback: retrying Binance WS...")
+            try:
+                await _binance_ws_feed()
+                logger.info("fallback: Binance reconnected - returning to primary feed")
+                return   # binance alive again; exit fallback loop
+            except asyncio.CancelledError:
+                raise
+            except ConnectionError:
+                logger.warning("fallback: Binance still unreachable")
+
+        # Try REST sources in priority order.
+        price = None
+        sources = [
+            (_COINGECKO_URL,   lambda d: float(d["bitcoin"]["usd"]),         "coingecko"),
+            (_COINPAPRIKA_URL, lambda d: float(d["quotes"]["USD"]["price"]), "coinpaprika"),
+        ]
+        for url, extract, source in sources:
+            try:
+                price = await _fetch_rest(url, extract)
+                if price and price > 0:
+                    market.feed_connected = True
+                    logger.debug(f"fallback price  ${price:,.2f}  [{source}]")
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"fallback {source} error: {e}")
+
+        if price and price > 0:
+            await _apply_price_tick(price)
+        else:
+            market.feed_connected = False
+            logger.warning("all fallback sources failed")
+            await manager.broadcast({"type": "state", "data": _full_state_dict()})
+
+        await asyncio.sleep(FALLBACK_POLL_INTERVAL)
+
+
+async def binance_price_feed():
+    """
+    Price feed orchestrator.
+    Primary:   Binance WebSocket (real-time, sub-second)
+    Fallback:  CoinGecko -> CoinPaprika REST polling (~10s cadence)
+    Auto-promotes back to Binance once it becomes reachable again.
+    """
+    global market
+    while True:
+        try:
+            await _binance_ws_feed()
+        except asyncio.CancelledError:
+            break
+        except ConnectionError:
+            try:
+                await _fallback_poll_feed()
+                # _fallback_poll_feed returns when Binance is back;
+                # loop around to restart primary.
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"fallback feed fatal: {e}")
+                await asyncio.sleep(5)
+        except Exception as e:
+            market.feed_connected = False
+            logger.error(f"price feed unexpected error: {e}")
+            await asyncio.sleep(5)
 
 # ── Paper Execution Hooks ──────────────────────────────────────────────────
 

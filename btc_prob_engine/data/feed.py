@@ -180,7 +180,20 @@ class DataRing:
 
 # ── Binance WebSocket Feed (no API key) ─────────────────────────────────────
 
-BINANCE_WS = "wss://stream.binance.com:9443/stream?streams="
+# URLs are overridable via env so a local relay (binance_relay.py) can be
+# transparently substituted when the machine cannot reach Binance directly.
+# Set BINANCE_PROXY_URL=ws://localhost:9001 in .env to use the relay.
+import os as _os
+
+_PROXY = _os.getenv("BINANCE_PROXY_URL", "").rstrip("/")
+
+if _PROXY:
+    # Relay serves all streams over a single combined connection.
+    BINANCE_WS         = _PROXY + "?streams="
+    BINANCE_FUTURES_WS = _PROXY + "?streams="
+else:
+    BINANCE_WS         = "wss://stream.binance.com:9443/stream?streams="
+    BINANCE_FUTURES_WS = "wss://fstream.binance.com/stream?streams="
 
 STREAMS = [
     "btcusdt@trade",
@@ -191,7 +204,6 @@ STREAMS = [
 ]
 
 # Futures (liquidations need futures stream)
-BINANCE_FUTURES_WS = "wss://fstream.binance.com/stream?streams="
 FUTURES_STREAMS = [
     "btcusdt@forceOrder",   # liquidations
     "btcusdt@kline_5m",     # futures candles for OI comparison
