@@ -1,0 +1,9 @@
+# Poly Trading Engine — Python dependencies
+# Install:  pip install -r requirements.txt
+
+fastapi>=0.110.0          # ASGI framework + WebSocket support
+uvicorn[standard]>=0.27.0 # ASGI server (standard extras = uvloop/httptools)
+websockets>=12.0          # Binance WS client
+loguru>=0.7.2             # structured logging
+python-dotenv>=1.0.0      # .env config loader
+numpy>=1.26.0             # feature matrix + model math
