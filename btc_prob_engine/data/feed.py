@@ -185,15 +185,19 @@ class DataRing:
 # Set BINANCE_PROXY_URL=ws://localhost:9001 in .env to use the relay.
 import os as _os
 
-_PROXY = _os.getenv("BINANCE_PROXY_URL", "").rstrip("/")
+def _resolve_ws_base(default_spot: str, default_futures: str):
+    """
+    Read BINANCE_PROXY_URL at call-time (not import-time) so that
+    load_dotenv() in ws_server.py has already run before we resolve URLs.
+    """
+    proxy = _os.getenv("BINANCE_PROXY_URL", "").rstrip("/")
+    if proxy:
+        return proxy + "?streams=", proxy + "?streams="
+    return default_spot, default_futures
 
-if _PROXY:
-    # Relay serves all streams over a single combined connection.
-    BINANCE_WS         = _PROXY + "?streams="
-    BINANCE_FUTURES_WS = _PROXY + "?streams="
-else:
-    BINANCE_WS         = "wss://stream.binance.com:9443/stream?streams="
-    BINANCE_FUTURES_WS = "wss://fstream.binance.com/stream?streams="
+# Module-level defaults (overridden in BinanceFeed.start() via _resolve_ws_base)
+BINANCE_WS         = "wss://stream.binance.com:9443/stream?streams="
+BINANCE_FUTURES_WS = "wss://fstream.binance.com/stream?streams="
 
 STREAMS = [
     "btcusdt@trade",
@@ -342,9 +346,14 @@ class BinanceFeed:
 
     async def start(self):
         self._running = True
+        # Resolve URLs here so load_dotenv() in ws_server has already run.
+        spot_url, fut_url = _resolve_ws_base(
+            "wss://stream.binance.com:9443/stream?streams=",
+            "wss://fstream.binance.com/stream?streams=",
+        )
         await asyncio.gather(
-            self._connect_stream(BINANCE_WS,         STREAMS,         self._parse_spot),
-            self._connect_stream(BINANCE_FUTURES_WS, FUTURES_STREAMS, self._parse_futures),
+            self._connect_stream(spot_url, STREAMS,         self._parse_spot),
+            self._connect_stream(fut_url,  FUTURES_STREAMS, self._parse_futures),
         )
 
     def stop(self):

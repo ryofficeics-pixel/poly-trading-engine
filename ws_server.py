@@ -93,6 +93,12 @@ logger.add(sys.stderr, level="INFO",
            format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {name} | {message}")
 logger.add("logs/poly_engine.log", rotation="50 MB", retention="30 days",
            level="DEBUG", enqueue=True)
+# Errors + warnings only — fast triage without grepping the full log.
+logger.add("logs/error.log",
+           rotation="20 MB", retention="30 days",
+           level="WARNING",
+           enqueue=True,
+           format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} | {message}")
 
 # ── Global state ───────────────────────────────────────────────────────────
 
