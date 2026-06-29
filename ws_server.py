@@ -222,12 +222,20 @@ def loguru_ws_sink(message):
 
 async def _apply_price_tick(price: float):
     """Apply a new BTC price to account state and broadcast to dashboards."""
+    global candle_synth
     now = time.time()
     market.btc_price       = price
     market.feed_latency_ms = int((now - market.last_tick_ts) * 1000)
     market.last_tick_ts    = now
 
     account.update_unrealized(price)
+
+    # Feed candle synthesizer in REST-only mode
+    if candle_synth is not None:
+        try:
+            await candle_synth.tick(price)
+        except Exception as e:
+            logger.debug(f"candle synth error: {e}")
 
     # Persist PnL updates periodically; never crash the feed loop on DB error.
     if int(now) % 10 == 0 and account.positions:
@@ -299,6 +307,7 @@ _COINGECKO_URL   = ("https://api.coingecko.com/api/v3/simple/price"
 _COINPAPRIKA_URL = "https://api.coinpaprika.com/v1/tickers/btc-bitcoin?quotes=USD"
 FALLBACK_POLL_INTERVAL        = float(os.getenv("FALLBACK_POLL_INTERVAL", "10"))  # seconds
 _FALLBACK_BINANCE_RETRY_EVERY = int(os.getenv("FALLBACK_BINANCE_RETRY_EVERY", "30"))
+SKIP_BINANCE_WS               = os.getenv("SKIP_BINANCE_WS", "false").lower() == "true"
 
 
 async def _fetch_rest(url: str, extract_fn) -> float:
@@ -330,8 +339,8 @@ async def _fallback_poll_feed():
     while True:
         poll_count += 1
 
-        # Periodically retry Binance primary feed.
-        if poll_count % _FALLBACK_BINANCE_RETRY_EVERY == 0:
+        # Periodically retry Binance primary feed (unless REST-only mode)
+        if not SKIP_BINANCE_WS and poll_count % _FALLBACK_BINANCE_RETRY_EVERY == 0:
             logger.info("fallback: retrying Binance WS...")
             try:
                 await _binance_ws_feed()
@@ -378,6 +387,18 @@ async def binance_price_feed():
     Auto-promotes back to Binance once it becomes reachable again.
     """
     global market
+    # REST-only mode: skip Binance WS entirely if configured
+    if SKIP_BINANCE_WS:
+        logger.info("REST-only mode enabled - skipping Binance WS")
+        try:
+            await _fallback_poll_feed()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"REST feed fatal: {e}")
+        return
+
+    # Normal mode: try Binance WS first, fallback to REST on failure
     while True:
         try:
             await _binance_ws_feed()
@@ -610,7 +631,7 @@ async def _run_engine():
     pipeline on every closed 1m candle: features → probability → risk → signal),
     then drives a fast exit-sweep and periodic state broadcasts.
     """
-    global engine_status, btc_engine
+    global engine_status, btc_engine, candle_synth
     logger.info(f"[ENGINE] started  capital=${account.starting_balance}  "
                 f"threshold={SIGNAL_THRESHOLD}  TP={TAKE_PROFIT_PCT}%  "
                 f"SL={STOP_LOSS_PCT}%  max_hold={MAX_HOLD_MINUTES}min")
@@ -627,12 +648,32 @@ async def _run_engine():
     feed_task = None
     exit_task = None
     try:
-        feed_task = asyncio.create_task(
-            btc_engine.start(
-                equity_fn=lambda: account.equity,
-                exposure_fn=lambda: account.exposure,
+        # In REST-only mode, don't start the engine's built-in Binance feed.
+        # Instead, wire the candle synthesizer to inject candles into the engine's DataRing.
+        if SKIP_BINANCE_WS:
+            # Initialize equity/exposure functions (normally set in engine.start())
+            btc_engine._equity_fn = lambda: account.equity
+            btc_engine._exposure_fn = lambda: account.exposure
+            btc_engine._running = True
+            
+            candle_synth = CandleSynthesizer()
+            @candle_synth.on_candle
+            async def handle_synth_candle(candle, ts):
+                if candle.closed:
+                    # Push candle to engine's DataRing
+                    btc_engine.ring.push_candle(candle)
+                    # Trigger engine's candle handler directly
+                    await btc_engine._on_closed_candle(candle, ts)
+            logger.info("[ENGINE] using candle synthesizer (REST-only mode)")
+        else:
+            # Normal mode: start engine's built-in Binance feed
+            feed_task = asyncio.create_task(
+                btc_engine.start(
+                    equity_fn=lambda: account.equity,
+                    exposure_fn=lambda: account.exposure,
+                )
             )
-        )
+        
         # Feed risk analytics into the risk engine after every settle.
         account_callbacks_on_settle.append(_record_trade_risk)
 
@@ -670,6 +711,8 @@ async def _run_engine():
                     pass
         if account_callbacks_on_settle and _record_trade_risk in account_callbacks_on_settle:
             account_callbacks_on_settle.remove(_record_trade_risk)
+        # Clean up candle synthesizer
+        candle_synth = None
         engine_status = EngineStatus.STOPPED
         logger.info("[ENGINE] stopped")
         await manager.broadcast({"type": "state", "data": _full_state_dict()})
