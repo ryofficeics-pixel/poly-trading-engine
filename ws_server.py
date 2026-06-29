@@ -49,6 +49,8 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
+from candle_synthesizer import CandleSynthesizer
+
 from src.database.db import (
     init_db, get_or_create_account, update_account_capital,
     create_session, close_session,
@@ -131,6 +133,9 @@ account_callbacks_on_settle: list = []
 
 # Lazily constructed in start_engine() so it inherits current account state.
 btc_engine: Optional[BTCProbEngine] = None
+
+# Candle synthesizer for REST-only mode (when Binance WS unavailable)
+candle_synth: Optional[CandleSynthesizer] = None
 
 # ── In-memory log ring ─────────────────────────────────────────────────────
 from collections import deque
