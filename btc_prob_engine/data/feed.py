@@ -137,6 +137,9 @@ class DataRing:
             return self.trades[-1].price
         if self.orderbook:
             return self.orderbook.mid
+        # ✅ FIX: In REST-only mode, no trades are pushed — fall back to candle close
+        if self.candles_1m:
+            return self.candles_1m[-1].close
         return 0.0
 
     def vwap(self, window: int = 100) -> float:

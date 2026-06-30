@@ -63,6 +63,7 @@ from src.database.db import (
 from src.portfolio.account import PaperAccount, PaperPosition
 from btc_prob_engine import BTCProbEngine
 from btc_prob_engine.risk import RiskParams
+from btc_prob_engine.data.feed import Trade as FeedTrade
 
 load_dotenv()
 
@@ -229,6 +230,17 @@ async def _apply_price_tick(price: float):
     market.last_tick_ts    = now
 
     account.update_unrealized(price)
+
+    # ✅ FIX: Push synthetic trade tick so DataRing.latest_price() works in REST mode
+    # Without this, latest_price() returns 0 → feature extraction exits early → no RSI
+    if btc_engine is not None and price > 0:
+        try:
+            btc_engine.ring.push_trade(FeedTrade(
+                exchange='synthetic', symbol='BTC-USDT',
+                price=price, size=0.0, side='buy', ts=now,
+            ))
+        except Exception:
+            pass
 
     # Feed candle synthesizer in REST-only mode
     if candle_synth is not None and price > 0:
