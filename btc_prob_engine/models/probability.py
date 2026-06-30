@@ -434,15 +434,22 @@ class BTCProbabilityEngine:
         """
         self.matrix.push(features)
 
-        latest = self.matrix.latest_x()
-        if latest is None:
-            return ProbabilityOutput(ts=time.time())
-
-        X, cols = latest
-
-        # ── Model probability ─────────────────────────────────────────────
-        raw_prob = self.model.predict_proba(X, cols)
-        cal_prob = self.calibrator.calibrate(raw_prob)
+        # ── No trained model: run heuristic directly on feature dict ─────
+        # latest_x() returns None until _col_order is populated by to_numpy()
+        # which requires labels (offline training). Bypass it when no model loaded.
+        if not self.model._is_loaded:
+            cols = sorted(features.keys())
+            X = np.array([[features.get(c, 0.0) for c in cols]], dtype=np.float32)
+            X = np.nan_to_num(X, nan=0.0)
+            raw_prob = self.model._proxy_predict(X, cols)
+            cal_prob = self.calibrator.calibrate(raw_prob)
+        else:
+            latest = self.matrix.latest_x()
+            if latest is None:
+                return ProbabilityOutput(ts=time.time())
+            X, cols = latest
+            raw_prob = self.model.predict_proba(X, cols)
+            cal_prob = self.calibrator.calibrate(raw_prob)
 
         # ── Microstructure override ───────────────────────────────────────
         # Strong imbalance + liquidation = amplify signal
