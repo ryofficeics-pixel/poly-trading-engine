@@ -6,3 +6,6 @@ logs/
 .vscode/
 .idea/
 *.pid
+%TEMP%/
+clob_tmp/
+nul
