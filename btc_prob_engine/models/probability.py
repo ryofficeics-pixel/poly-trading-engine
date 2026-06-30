@@ -224,57 +224,71 @@ class GradientBoostProxy:
 
     def _proxy_predict(self, X: np.ndarray, cols: List[str]) -> float:
         """
-        Feature-weighted ensemble — interpretable rule-based probability.
-        Each feature votes with a weight; sigmoid aggregation.
-        Architecture: PyCaret compare_models() → weighted vote fallback.
+        Simple heuristic model using RSI + volatility + trend alignment.
+        Generates actual trading signals instead of returning flat 0.5.
         """
         if X.shape[1] == 0:
             return 0.5
 
         feat = {cols[i]: float(X[0, i]) for i in range(len(cols))}
-
-        votes  = []
-        weights = []
-
-        # RSI multi-TF (weight 2 each)
-        for key, w in [("rsi14_1m", 2.0), ("rsi14_5m", 2.5), ("rsi14_1h", 3.0)]:
-            if key in feat:
-                v = feat[key]  # already 0-1
-                votes.append(v); weights.append(w)
-
-        # EMA trend (weight 3)
-        for key, w in [("ema_cross_1m", 3.0), ("regime_ema_aligned_up", 3.0)]:
-            if key in feat:
-                votes.append(feat[key]); weights.append(w)
-
-        # Order flow (weight 4 — most important microstructure signal)
-        if "order_book_imbalance" in feat:
-            votes.append(feat["order_book_imbalance"]); weights.append(4.0)
-        if "buy_sell_ratio_200" in feat:
-            votes.append(feat["buy_sell_ratio_200"]); weights.append(3.5)
-
-        # Bollinger %B (weight 1.5)
-        for key in ["bb_pct_b_1m", "bb_pct_b_5m"]:
-            if key in feat:
-                votes.append(feat[key]); weights.append(1.5)
-
-        # Liquidation pressure (weight 2)
-        if "liq_net_pressure" in feat:
-            v = (feat["liq_net_pressure"] + 1) / 2  # [-1,1] → [0,1]
-            votes.append(v); weights.append(2.0)
-
-        # Trend regime (weight 2)
-        if "regime_trend_score" in feat:
-            votes.append(feat["regime_trend_score"]); weights.append(2.0)
-
-        # TF alignment (weight 2)
-        if "tf_alignment" in feat:
-            v = (feat["tf_alignment"] + 1) / 2  # [-1,1] → [0,1]
-            votes.append(v); weights.append(2.0)
-
-        # MACD
-        if "macd_above_signal_1m" in feat:
-            votes.append(feat["macd_above_signal_1m"]); weights.append(1.5)
+        
+        # Extract key indicators (normalized to 0-1 scale)
+        rsi_1m = feat.get("rsi14_1m", 0.5)
+        rsi_5m = feat.get("rsi14_5m", 0.5)
+        rsi_1h = feat.get("rsi14_1h", 0.5)
+        bb_pct_b = feat.get("bb_pct_b_1m", 0.5)
+        regime = feat.get("regime_trend_score", 0.5)
+        
+        # Simple multi-timeframe RSI strategy
+        # Oversold: RSI < 0.3 (30 on 0-100 scale) → LONG bias
+        # Overbought: RSI > 0.7 (70 on 0-100 scale) → SHORT bias
+        
+        long_score = 0.0
+        short_score = 0.0
+        
+        # RSI signals (strongest weight)
+        if rsi_1m < 0.30:
+            long_score += 3.0
+        elif rsi_1m > 0.70:
+            short_score += 3.0
+            
+        if rsi_5m < 0.35:
+            long_score += 2.5
+        elif rsi_5m > 0.65:
+            short_score += 2.5
+            
+        if rsi_1h < 0.40:
+            long_score += 2.0
+        elif rsi_1h > 0.60:
+            short_score += 2.0
+        
+        # Bollinger Band position (mean reversion)
+        if bb_pct_b < 0.2:  # Price near lower band
+            long_score += 1.5
+        elif bb_pct_b > 0.8:  # Price near upper band
+            short_score += 1.5
+            
+        # Regime/trend confirmation
+        if regime > 0.6:  # Strong uptrend
+            long_score += 1.0
+        elif regime < 0.4:  # Strong downtrend
+            short_score += 1.0
+        
+        # Convert scores to probability
+        total = long_score + short_score
+        if total == 0:
+            return 0.5  # Neutral if no signals
+        
+        long_prob = long_score / total
+        
+        # Add slight momentum to move away from 0.5 when signals present
+        if long_prob > 0.5:
+            long_prob = 0.5 + (long_prob - 0.5) * 1.2  # Amplify bullish bias
+        elif long_prob < 0.5:
+            long_prob = 0.5 - (0.5 - long_prob) * 1.2  # Amplify bearish bias
+            
+        # Clamp to [0.2, 0.8] to prevent extreme predictions without ML
+        return max(0.2, min(0.8, long_prob))
 
         # Volume
         if "vol_ratio_1m" in feat:
