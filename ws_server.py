@@ -31,6 +31,9 @@ import os
 import sys
 import time
 import uuid
+import urllib.request
+import urllib.error
+import random
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -651,6 +654,79 @@ async def _exit_sweep():
             await paper_settle(oid, price)
 
 
+async def _seed_data_ring(ring) -> None:
+    """
+    Seed the DataRing with ~30 historical candles so RSI/BB work immediately
+    on engine start (instead of waiting 15+ minutes).
+    Falls back to synthetic random-walk candles if API fails.
+    """
+    from btc_prob_engine.data.feed import Candle as FeedCandle, Trade as FeedTrade
+
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/bitcoin/ohlc?vs_currency=usd&days=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        candles = data[-30:] if len(data) >= 30 else data
+        now = time.time()
+        for i, entry in enumerate(candles):
+            _, o, h, l, c = entry
+            ts = now - (len(candles) - i) * 60
+            ring.push_candle(FeedCandle(
+                exchange='coingecko_seed', symbol='BTC-USDT', interval='1m',
+                open=float(o), high=float(h), low=float(l), close=float(c),
+                volume=random.uniform(2.0, 8.0), ts=ts, closed=True,
+            ))
+            ring.push_trade(FeedTrade(
+                exchange='coingecko_seed', symbol='BTC-USDT',
+                price=float(c), size=1.0, side='buy', ts=ts,
+            ))
+        logger.info(f"[ENGINE] DataRing seeded with {len(candles)} historical candles (CoinGecko)")
+    except Exception as e:
+        logger.warning(f"[ENGINE] CoinGecko seed failed ({e}) — using synthetic candles")
+        price = market.btc_price or 60000.0
+        now = time.time()
+        for i in range(30):
+            price = price * (1 + random.uniform(-0.003, 0.003))
+            ts = now - (30 - i) * 60
+            ring.push_candle(FeedCandle(
+                exchange='synthetic_seed', symbol='BTC-USDT', interval='1m',
+                open=price * (1 + random.uniform(-0.001, 0.001)),
+                high=price * (1 + random.uniform(0, 0.002)),
+                low=price * (1 - random.uniform(0, 0.002)),
+                close=price,
+                volume=random.uniform(2.0, 8.0), ts=ts, closed=True,
+            ))
+            ring.push_trade(FeedTrade(
+                exchange='synthetic_seed', symbol='BTC-USDT',
+                price=price, size=1.0, side='buy', ts=ts,
+            ))
+        logger.info("[ENGINE] DataRing seeded with 30 synthetic candles (fallback)")
+
+
+async def _trigger_engine_pipeline(engine) -> None:
+    """
+    After seeding DataRing, run one inference cycle so _last_features,
+    _last_prob_output, and _last_risk_score are populated immediately.
+    Also ensures market.btc_price is set from seeded data before first signal.
+    """
+    try:
+        from btc_prob_engine.data.feed import Candle as FeedCandle
+        import time as _time
+
+        # Ensure market price is set from seeded candles before pipeline runs
+        if engine.ring.candles_1m and market.btc_price <= 0:
+            market.btc_price = engine.ring.candles_1m[-1].close
+            logger.info(f"[ENGINE] market price set from seed: ${market.btc_price:,.2f}")
+
+        if engine.ring.candles_1m:
+            last = engine.ring.candles_1m[-1]
+            await engine._on_closed_candle(last, _time.time())
+            logger.info("[ENGINE] pipeline primed from seeded candles")
+    except Exception as e:
+        logger.debug(f"pipeline prime failed: {e}")
+
+
 async def _broadcast_engine_state():
     """Push probability / risk / feature snapshot to dashboards."""
     if btc_engine is None:
@@ -705,6 +781,11 @@ async def _run_engine():
                     # Trigger engine's candle handler directly
                     await btc_engine._on_closed_candle(candle, ts)
             logger.info("[ENGINE] using candle synthesizer (REST-only mode)")
+
+            # ✅ Seed DataRing with 30 historical 1m candles so RSI/BB work immediately
+            await _seed_data_ring(btc_engine.ring)
+            # ✅ Prime the pipeline so features/prob/risk are populated immediately
+            await _trigger_engine_pipeline(btc_engine)
         else:
             # Normal mode: start engine's built-in Binance feed
             feed_task = asyncio.create_task(

@@ -224,87 +224,57 @@ class GradientBoostProxy:
 
     def _proxy_predict(self, X: np.ndarray, cols: List[str]) -> float:
         """
-        Simple heuristic model using RSI + volatility + trend alignment.
-        Generates actual trading signals instead of returning flat 0.5.
+        Multi-factor heuristic model using RSI + Bollinger Bands + trend.
+        Designed to generate signals in normal market conditions (not just extremes).
+        ✅ Lowered thresholds: fires on RSI 40/60 range instead of 30/70 only.
         """
         if X.shape[1] == 0:
             return 0.5
 
         feat = {cols[i]: float(X[0, i]) for i in range(len(cols))}
-        
-        # Extract key indicators (normalized to 0-1 scale)
-        rsi_1m = feat.get("rsi14_1m", 0.5)
-        rsi_5m = feat.get("rsi14_5m", 0.5)
-        rsi_1h = feat.get("rsi14_1h", 0.5)
-        bb_pct_b = feat.get("bb_pct_b_1m", 0.5)
-        regime = feat.get("regime_trend_score", 0.5)
-        
-        # Simple multi-timeframe RSI strategy
-        # Oversold: RSI < 0.3 (30 on 0-100 scale) → LONG bias
-        # Overbought: RSI > 0.7 (70 on 0-100 scale) → SHORT bias
-        
-        long_score = 0.0
+
+        rsi_1m  = feat.get("rsi14_1m", 0.5)
+        rsi_5m  = feat.get("rsi14_5m", 0.5)
+        rsi_1h  = feat.get("rsi14_1h", 0.5)
+        bb_pct  = feat.get("bb_pct_b_1m", 0.5)
+        regime  = feat.get("regime_trend_score", 0.5)
+
+        long_score  = 0.0
         short_score = 0.0
-        
-        # RSI signals (strongest weight)
-        if rsi_1m < 0.30:
-            long_score += 3.0
-        elif rsi_1m > 0.70:
-            short_score += 3.0
-            
-        if rsi_5m < 0.35:
-            long_score += 2.5
-        elif rsi_5m > 0.65:
-            short_score += 2.5
-            
-        if rsi_1h < 0.40:
-            long_score += 2.0
-        elif rsi_1h > 0.60:
-            short_score += 2.0
-        
-        # Bollinger Band position (mean reversion)
-        if bb_pct_b < 0.2:  # Price near lower band
-            long_score += 1.5
-        elif bb_pct_b > 0.8:  # Price near upper band
-            short_score += 1.5
-            
-        # Regime/trend confirmation
-        if regime > 0.6:  # Strong uptrend
-            long_score += 1.0
-        elif regime < 0.4:  # Strong downtrend
-            short_score += 1.0
-        
-        # Convert scores to probability
+
+        # RSI signals — fire on 40/60 range (normal conditions) not just 30/70
+        # 1m RSI (weight 3.0)
+        if rsi_1m < 0.40:    long_score  += 3.0 * (0.40 - rsi_1m) / 0.40
+        elif rsi_1m > 0.60:  short_score += 3.0 * (rsi_1m - 0.60) / 0.40
+
+        # 5m RSI (weight 2.5)
+        if rsi_5m < 0.42:    long_score  += 2.5 * (0.42 - rsi_5m) / 0.42
+        elif rsi_5m > 0.58:  short_score += 2.5 * (rsi_5m - 0.58) / 0.42
+
+        # 1h RSI (weight 2.0)
+        if rsi_1h < 0.45:    long_score  += 2.0 * (0.45 - rsi_1h) / 0.45
+        elif rsi_1h > 0.55:  short_score += 2.0 * (rsi_1h - 0.55) / 0.45
+
+        # Bollinger Band %B (weight 2.0 — mean reversion)
+        if bb_pct < 0.35:    long_score  += 2.0 * (0.35 - bb_pct) / 0.35
+        elif bb_pct > 0.65:  short_score += 2.0 * (bb_pct - 0.65) / 0.35
+
+        # Regime / trend (weight 1.5)
+        if regime > 0.55:    long_score  += 1.5 * (regime - 0.55) / 0.45
+        elif regime < 0.45:  short_score += 1.5 * (0.45 - regime) / 0.45
+
         total = long_score + short_score
-        if total == 0:
-            return 0.5  # Neutral if no signals
-        
+        if total < 0.01:
+            return 0.5  # Genuinely neutral, no signals
+
         long_prob = long_score / total
-        
-        # Add slight momentum to move away from 0.5 when signals present
-        if long_prob > 0.5:
-            long_prob = 0.5 + (long_prob - 0.5) * 1.2  # Amplify bullish bias
-        elif long_prob < 0.5:
-            long_prob = 0.5 - (0.5 - long_prob) * 1.2  # Amplify bearish bias
-            
-        # Clamp to [0.2, 0.8] to prevent extreme predictions without ML
-        return max(0.2, min(0.8, long_prob))
 
-        # Volume
-        if "vol_ratio_1m" in feat:
-            v = min(1.0, feat["vol_ratio_1m"] / 3)  # normalize
-            votes.append(v * feat.get("is_bull_candle", 0.5)); weights.append(1.0)
+        # Amplify signal strength away from 0.5
+        bias = long_prob - 0.5
+        long_prob = 0.5 + bias * 1.5
 
-        if not votes:
-            return 0.5
-
-        total_w = sum(weights)
-        weighted = sum(v * w for v, w in zip(votes, weights))
-        raw = weighted / total_w
-
-        # Sigmoid squash to soften extremes (XGBoost logistic objective pattern)
-        raw_shifted = raw - 0.5
-        return 1 / (1 + math.exp(-8 * raw_shifted))
+        # Clamp to [0.25, 0.75] — heuristic shouldn't be too extreme
+        return max(0.25, min(0.75, long_prob))
 
     def feature_importance(self) -> Dict[str, float]:
         if self._feature_imp:
@@ -464,16 +434,17 @@ class BTCProbabilityEngine:
 
         # ── Regime gate ───────────────────────────────────────────────────
         # In high-vol / low-hurst regime, compress toward 0.5 (reduce conviction)
+        # ✅ FIX: Relaxed gates - hurst 0.5 default was crushing all signals
         regime_mult = 1.0
         if "garch_vol_1m" in features:
-            # If vol > 200% annualized (crypto extreme), reduce confidence
-            if features["garch_vol_1m"] > 200:
-                regime_mult = 0.7
+            if features["garch_vol_1m"] > 300:  # raised from 200 → 300
+                regime_mult = 0.85  # reduced penalty: was 0.7
         if "hurst_1m" in features:
             h = features["hurst_1m"]
-            # Near random walk → no edge
-            if 0.45 <= h <= 0.55:
-                regime_mult *= 0.8
+            # Only apply near-random-walk penalty when hurst is explicitly computed
+            # (non-default value). Default 0.5 = not computed, not a signal.
+            if h != 0.5 and 0.45 <= h <= 0.55:
+                regime_mult *= 0.9  # reduced penalty: was 0.8
 
         # ── Final probability ─────────────────────────────────────────────
         final_prob = cal_prob + micro_adj
