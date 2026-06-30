@@ -224,57 +224,161 @@ class GradientBoostProxy:
 
     def _proxy_predict(self, X: np.ndarray, cols: List[str]) -> float:
         """
-        Multi-factor heuristic model using RSI + Bollinger Bands + trend.
-        Designed to generate signals in normal market conditions (not just extremes).
-        ✅ Lowered thresholds: fires on RSI 40/60 range instead of 30/70 only.
+        Full-featured ensemble heuristic using every available indicator.
+
+        Signal groups (with weights):
+          1. RSI multi-timeframe        (1m: 3.0, 5m: 2.5, 1h: 2.0)
+          2. Bollinger Bands %B         (mean-reversion: 2.0)
+          3. EMA trend                  (cross + distance: 2.0)
+          4. MACD histogram             (momentum: 1.5)
+          5. VWAP deviation             (price vs fair value: 1.5)
+          6. Regime / Hurst             (trend confirmation: 1.5)
+          7. Candle structure           (body/wick: 1.0)
+          8. Volume ratio               (volume confirmation: 1.0)
+          9. Multi-TF alignment         (agreement: 1.0)
+         10. ATR volatility gate        (reduce size in high vol)
+
+        Proportional scoring: each indicator contributes a
+        fraction of its max weight based on signal strength.
+        Returns long_prob in [0.25, 0.75].
         """
         if X.shape[1] == 0:
             return 0.5
 
-        feat = {cols[i]: float(X[0, i]) for i in range(len(cols))}
-
-        rsi_1m  = feat.get("rsi14_1m", 0.5)
-        rsi_5m  = feat.get("rsi14_5m", 0.5)
-        rsi_1h  = feat.get("rsi14_1h", 0.5)
-        bb_pct  = feat.get("bb_pct_b_1m", 0.5)
-        regime  = feat.get("regime_trend_score", 0.5)
+        f = {cols[i]: float(X[0, i]) for i in range(len(cols))}
 
         long_score  = 0.0
         short_score = 0.0
+        total_weight = 0.0
 
-        # RSI signals — fire on 40/60 range (normal conditions) not just 30/70
-        # 1m RSI (weight 3.0)
-        if rsi_1m < 0.40:    long_score  += 3.0 * (0.40 - rsi_1m) / 0.40
-        elif rsi_1m > 0.60:  short_score += 3.0 * (rsi_1m - 0.60) / 0.40
+        def _add(long_pts: float, short_pts: float, weight: float):
+            nonlocal long_score, short_score, total_weight
+            long_score   += long_pts  * weight
+            short_score  += short_pts * weight
+            total_weight += weight
 
-        # 5m RSI (weight 2.5)
-        if rsi_5m < 0.42:    long_score  += 2.5 * (0.42 - rsi_5m) / 0.42
-        elif rsi_5m > 0.58:  short_score += 2.5 * (rsi_5m - 0.58) / 0.42
+        # ── 1. RSI multi-timeframe ─────────────────────────────────────────
+        # Normalized 0-1: < 0.4 = oversold (long), > 0.6 = overbought (short)
+        for key, w in [("rsi14_1m", 3.0), ("rsi14_5m", 2.5), ("rsi14_1h", 2.0)]:
+            v = f.get(key, 0.5)
+            if v == 0.0:  # Not yet computed, skip
+                continue
+            if v < 0.5:
+                _add((0.5 - v) * 2, 0.0, w)   # oversold → long bias
+            else:
+                _add(0.0, (v - 0.5) * 2, w)   # overbought → short bias
 
-        # 1h RSI (weight 2.0)
-        if rsi_1h < 0.45:    long_score  += 2.0 * (0.45 - rsi_1h) / 0.45
-        elif rsi_1h > 0.55:  short_score += 2.0 * (rsi_1h - 0.55) / 0.45
+        # ── 2. Bollinger Bands %B (mean reversion) ────────────────────────
+        bb = f.get("bb_pct_b_1m", 0.5)
+        if bb != 0.5 or "bb_pct_b_1m" in f:
+            if bb < 0.5:
+                _add((0.5 - bb) * 2, 0.0, 2.0)
+            else:
+                _add(0.0, (bb - 0.5) * 2, 2.0)
 
-        # Bollinger Band %B (weight 2.0 — mean reversion)
-        if bb_pct < 0.35:    long_score  += 2.0 * (0.35 - bb_pct) / 0.35
-        elif bb_pct > 0.65:  short_score += 2.0 * (bb_pct - 0.65) / 0.35
+        # ── 3. EMA trend (cross + distance) ──────────────────────────────
+        ema_cross = f.get("ema_cross_1m", -1.0)  # 1=bull, 0=bear
+        ema_dist  = f.get("ema21_dist_pct", 0.0) # % above/below EMA21
+        if ema_cross >= 0:
+            strength = min(abs(ema_dist) / 2.0, 1.0)  # normalize to 0-1
+            if ema_cross == 1.0:
+                _add(0.5 + strength * 0.5, 0.0, 2.0)
+            else:
+                _add(0.0, 0.5 + strength * 0.5, 2.0)
 
-        # Regime / trend (weight 1.5)
-        if regime > 0.55:    long_score  += 1.5 * (regime - 0.55) / 0.45
-        elif regime < 0.45:  short_score += 1.5 * (0.45 - regime) / 0.45
+        # ── 4. MACD histogram (momentum) ─────────────────────────────────
+        macd_hist = f.get("macd_hist_1m", 0.0)
+        macd_above = f.get("macd_above_signal_1m", -1.0)
+        if macd_above >= 0 or macd_hist != 0.0:
+            if macd_hist > 0 or macd_above == 1.0:
+                strength = min(abs(macd_hist) * 10000, 1.0)
+                _add(0.5 + strength * 0.5, 0.0, 1.5)
+            else:
+                strength = min(abs(macd_hist) * 10000, 1.0)
+                _add(0.0, 0.5 + strength * 0.5, 1.5)
 
+        # ── 5. VWAP deviation ─────────────────────────────────────────────
+        vwap_dev = f.get("price_vs_vwap_pct", 0.0)
+        if vwap_dev != 0.0:
+            # Below VWAP → buy opportunity; above VWAP → short opportunity
+            strength = min(abs(vwap_dev) / 1.0, 1.0)  # 1% = full signal
+            if vwap_dev < 0:
+                _add(strength, 0.0, 1.5)
+            else:
+                _add(0.0, strength, 1.5)
+
+        # ── 6. Regime / Hurst ────────────────────────────────────────────
+        regime = f.get("regime_trend_score", 0.5)
+        hurst  = f.get("hurst_1m", 0.5)
+        if regime != 0.5:
+            if regime > 0.5:
+                _add((regime - 0.5) * 2, 0.0, 1.5)
+            else:
+                _add(0.0, (0.5 - regime) * 2, 1.5)
+        # Hurst > 0.6 = trending, < 0.4 = mean-reverting
+        if hurst != 0.5:
+            # Strong trend (Hurst > 0.7): follow RSI direction
+            # Mean-revert (Hurst < 0.4): amplify BB signal
+            if hurst > 0.6:
+                # trending — add weight to existing direction
+                trend_bias = (long_score - short_score) / (total_weight + 0.001)
+                if trend_bias > 0:
+                    _add(hurst - 0.5, 0.0, 0.5)
+                elif trend_bias < 0:
+                    _add(0.0, hurst - 0.5, 0.5)
+
+        # ── 7. Candle structure ───────────────────────────────────────────
+        body_pct  = f.get("candle_body_pct", 0.5)
+        low_wick  = f.get("lower_wick_pct", 0.5)
+        high_wick = f.get("upper_wick_pct", 0.5)
+        is_bull   = f.get("is_bull_candle", 0.5)
+        # Long lower wick = buying pressure; long upper wick = selling pressure
+        if low_wick > 0.6:
+            _add(low_wick - 0.5, 0.0, 1.0)
+        if high_wick > 0.6:
+            _add(0.0, high_wick - 0.5, 1.0)
+        if is_bull == 1.0 and body_pct > 0.5:
+            _add(body_pct - 0.3, 0.0, 0.5)
+        elif is_bull == 0.0 and body_pct > 0.5:
+            _add(0.0, body_pct - 0.3, 0.5)
+
+        # ── 8. Volume ratio ───────────────────────────────────────────────
+        vol_ratio = f.get("vol_ratio_1m", 1.0)
+        buy_pressure = f.get("buy_pressure", 0.5)
+        if vol_ratio > 1.2 and buy_pressure > 0.5:
+            # High-volume bullish candle = confirmation
+            direction = (long_score - short_score) / (total_weight + 0.001)
+            if direction > 0:
+                _add(min(vol_ratio - 1.0, 1.0), 0.0, 1.0)
+            else:
+                _add(0.0, min(vol_ratio - 1.0, 1.0), 1.0)
+
+        # ── 9. Multi-TF alignment ─────────────────────────────────────────
+        tf_align = f.get("tf_alignment", 0.0)  # -1 to +1
+        if tf_align != 0.0:
+            if tf_align > 0:
+                _add(tf_align, 0.0, 1.0)
+            else:
+                _add(0.0, -tf_align, 1.0)
+
+        # ── Final probability ─────────────────────────────────────────────
         total = long_score + short_score
         if total < 0.01:
-            return 0.5  # Genuinely neutral, no signals
+            return 0.5  # No signals at all
 
         long_prob = long_score / total
 
-        # Amplify signal strength away from 0.5
+        # Amplify: stronger signals should produce more extreme probabilities
         bias = long_prob - 0.5
-        long_prob = 0.5 + bias * 1.5
+        long_prob = 0.5 + bias * 1.6
 
-        # Clamp to [0.25, 0.75] — heuristic shouldn't be too extreme
-        return max(0.25, min(0.75, long_prob))
+        # ATR volatility gate: in extreme vol, compress toward 0.5
+        atr_pct = f.get("atr_pct_1m", 0.3)
+        if atr_pct > 1.5:  # > 1.5% ATR = very high vol, reduce conviction
+            long_prob = 0.5 + (long_prob - 0.5) * 0.7
+
+        # Clamp to [0.20, 0.80]
+        return max(0.20, min(0.80, long_prob))
 
     def feature_importance(self) -> Dict[str, float]:
         if self._feature_imp:

@@ -507,23 +507,26 @@ class FeatureEngineer:
             closes_5m = _closes(c5m)
             rets_5m   = _returns(closes_5m)
 
-            features["rsi14_5m"]     = _safe(rsi(closes_5m, 14)) / 100
-            features["ema21_5m"]     = _safe(ema(closes_5m, 21))
+            # Use RSI7 when we have 8-14 candles, RSI14 when we have 15+
+            rsi_period_5m = 7 if len(closes_5m) < 15 else 14
+            features["rsi14_5m"]     = _safe(rsi(closes_5m, rsi_period_5m)) / 100
+            features["ema21_5m"]     = _safe(ema(closes_5m, min(21, len(closes_5m)-1)))
             features["ema50_5m"]     = _safe(ema(closes_5m, 50))
             e21_5m = features["ema21_5m"]
             if e21_5m > 0:
                 features["ema21_5m_dist"] = _safe((price - e21_5m) / e21_5m * 100)
-            features["garch_vol_5m"] = _safe(garch_vol_proxy(rets_5m))
-            bb_up5, bb_mid5, bb_lo5, pct_b5 = bollinger(closes_5m, 20, 2)
+            features["garch_vol_5m"] = _safe(garch_vol_proxy(rets_5m)) if len(rets_5m) >= 5 else 0.0
+            bb_period_5m = min(20, len(closes_5m))
+            bb_up5, bb_mid5, bb_lo5, pct_b5 = bollinger(closes_5m, bb_period_5m, 2)
             features["bb_pct_b_5m"]  = _safe(pct_b5, 0.5)
-            features["atr_pct_5m"]   = _safe(atr(c5m, 14))
+            features["atr_pct_5m"]   = _safe(atr(c5m, min(14, len(c5m)-1)))
             features["hurst_5m"]     = hurst_exponent(closes_5m)
 
             # 5m momentum: last 3 candle direction
             if len(c5m) >= 3:
                 features["mom3_5m"] = _safe(
                     (closes_5m[-1] - closes_5m[-4]) / closes_5m[-4] * 100
-                    if closes_5m[-4] > 0 else 0
+                    if len(closes_5m) >= 4 and closes_5m[-4] > 0 else 0
                 )
 
         # ── 1h features ──────────────────────────────────────────────────

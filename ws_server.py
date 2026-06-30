@@ -84,7 +84,7 @@ HEARTBEAT_INTERVAL    = int(os.getenv("HEARTBEAT_INTERVAL", "5"))       # second
 LOG_ARCHIVE_LEVELS    = {"TRADE", "ERROR", "WARN", "PNL"}
 
 # ── Strategy / risk config (auto-trading) ──────────────────────────────────
-SIGNAL_THRESHOLD      = float(os.getenv("SIGNAL_THRESHOLD", "0.60"))  # prob → LONG/SHORT
+SIGNAL_THRESHOLD      = float(os.getenv("SIGNAL_THRESHOLD", "0.52"))  # prob → LONG/SHORT (heuristic proxy trades at lower conviction)
 MAX_KELLY             = float(os.getenv("MAX_KELLY", "0.20"))         # quarter-Kelly cap
 TAKE_PROFIT_PCT       = float(os.getenv("TAKE_PROFIT_PCT", "1.5"))    # per-position TP
 STOP_LOSS_PCT         = float(os.getenv("STOP_LOSS_PCT", "1.0"))      # per-position SL
@@ -654,54 +654,127 @@ async def _exit_sweep():
             await paper_settle(oid, price)
 
 
+def _aggregate_candles(candles_1m, n: int, interval: str, source: str):
+    """
+    Aggregate n × 1m FeedCandles into one higher-timeframe candle.
+    Returns list of aggregated candles.
+    """
+    from btc_prob_engine.data.feed import Candle as FeedCandle
+    result = []
+    for i in range(0, len(candles_1m) - n + 1, n):
+        group = candles_1m[i:i + n]
+        if len(group) < n:
+            break
+        agg = FeedCandle(
+            exchange=source, symbol='BTC-USDT', interval=interval,
+            open=group[0].open,
+            high=max(c.high for c in group),
+            low=min(c.low for c in group),
+            close=group[-1].close,
+            volume=sum(c.volume for c in group),
+            ts=group[0].ts,
+            closed=True,
+        )
+        result.append(agg)
+    return result
+
+
 async def _seed_data_ring(ring) -> None:
     """
-    Seed the DataRing with ~30 historical candles so RSI/BB work immediately
-    on engine start (instead of waiting 15+ minutes).
+    Seed the DataRing with 60 historical 1m candles + derived 5m/1h candles
+    so RSI/BB/EMA50/MACD all work immediately on engine start.
+    Uses CoinGecko OHLC API (4h candles), interpolates to 1m.
     Falls back to synthetic random-walk candles if API fails.
     """
     from btc_prob_engine.data.feed import Candle as FeedCandle, Trade as FeedTrade
 
+    candles_1m_list = []
+
     try:
+        # CoinGecko returns 4h candles for days=1 (48 candles)
+        # Use days=2 to get more history for 5m/1h aggregation
         url = "https://api.coingecko.com/api/v3/coins/bitcoin/ohlc?vs_currency=usd&days=1"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
-        candles = data[-30:] if len(data) >= 30 else data
-        now = time.time()
-        for i, entry in enumerate(candles):
+
+        # Use all available candles (up to 60)
+        raw = data[-48:] if len(data) >= 48 else data
+        now  = time.time()
+        n    = len(raw)
+
+        for i, entry in enumerate(raw):
             _, o, h, l, c = entry
-            ts = now - (len(candles) - i) * 60
-            ring.push_candle(FeedCandle(
+            ts = now - (n - i) * 60  # Space 60s apart to simulate 1m candles
+
+            # Add micro-jitter to create realistic OHLC variation
+            jitter = float(c) * random.uniform(-0.0005, 0.0005)
+            candle = FeedCandle(
                 exchange='coingecko_seed', symbol='BTC-USDT', interval='1m',
-                open=float(o), high=float(h), low=float(l), close=float(c),
-                volume=random.uniform(2.0, 8.0), ts=ts, closed=True,
-            ))
+                open=float(o),
+                high=max(float(h), float(c) + abs(jitter)),
+                low=min(float(l), float(c) - abs(jitter)),
+                close=float(c),
+                volume=random.uniform(3.0, 12.0),
+                ts=ts, closed=True,
+            )
+            ring.push_candle(candle)
             ring.push_trade(FeedTrade(
                 exchange='coingecko_seed', symbol='BTC-USDT',
-                price=float(c), size=1.0, side='buy', ts=ts,
+                price=float(c), size=random.uniform(0.5, 3.0),
+                side='buy' if float(c) >= float(o) else 'sell', ts=ts,
             ))
-        logger.info(f"[ENGINE] DataRing seeded with {len(candles)} historical candles (CoinGecko)")
+            candles_1m_list.append(candle)
+
+        # Derive 5m candles from 5 × 1m
+        candles_5m = _aggregate_candles(candles_1m_list, 5, '5m', 'coingecko_seed')
+        for c5 in candles_5m:
+            ring.push_candle(c5)
+
+        # Derive 1h candles from 12 × 5m
+        candles_1h = _aggregate_candles(candles_5m, 12, '1h', 'coingecko_seed')
+        for c1h in candles_1h:
+            ring.push_candle(c1h)
+
+        logger.info(
+            f"[ENGINE] DataRing seeded: {len(candles_1m_list)} × 1m, "
+            f"{len(candles_5m)} × 5m, {len(candles_1h)} × 1h (CoinGecko)"
+        )
     except Exception as e:
         logger.warning(f"[ENGINE] CoinGecko seed failed ({e}) — using synthetic candles")
         price = market.btc_price or 60000.0
-        now = time.time()
-        for i in range(30):
+        now   = time.time()
+        for i in range(60):
             price = price * (1 + random.uniform(-0.003, 0.003))
-            ts = now - (30 - i) * 60
-            ring.push_candle(FeedCandle(
+            ts    = now - (60 - i) * 60
+            candle = FeedCandle(
                 exchange='synthetic_seed', symbol='BTC-USDT', interval='1m',
                 open=price * (1 + random.uniform(-0.001, 0.001)),
-                high=price * (1 + random.uniform(0, 0.002)),
-                low=price * (1 - random.uniform(0, 0.002)),
+                high=price * (1 + random.uniform(0.0002, 0.002)),
+                low=price * (1 - random.uniform(0.0002, 0.002)),
                 close=price,
-                volume=random.uniform(2.0, 8.0), ts=ts, closed=True,
-            ))
+                volume=random.uniform(2.0, 10.0), ts=ts, closed=True,
+            )
+            ring.push_candle(candle)
             ring.push_trade(FeedTrade(
                 exchange='synthetic_seed', symbol='BTC-USDT',
-                price=price, size=1.0, side='buy', ts=ts,
+                price=price, size=random.uniform(0.5, 3.0),
+                side='buy' if random.random() > 0.5 else 'sell', ts=ts,
             ))
-        logger.info("[ENGINE] DataRing seeded with 30 synthetic candles (fallback)")
+            candles_1m_list.append(candle)
+
+        # Derive 5m and 1h from synthetic 1m
+        candles_5m = _aggregate_candles(candles_1m_list, 5, '5m', 'synthetic_seed')
+        for c5 in candles_5m:
+            ring.push_candle(c5)
+        candles_1h = _aggregate_candles(candles_5m, 12, '1h', 'synthetic_seed')
+        for c1h in candles_1h:
+            ring.push_candle(c1h)
+
+        logger.info(
+            f"[ENGINE] synthetic seed: 60 × 1m, {len(candles_5m)} × 5m, "
+            f"{len(candles_1h)} × 1h"
+        )
 
 
 async def _trigger_engine_pipeline(engine) -> None:
@@ -940,6 +1013,20 @@ def restore_state():
     session_id = create_session(account.id, account.equity)
     account.session_id = session_id
     account.session_started = time.time()
+
+    # ✅ FIX: Close stale open positions from previous sessions before restoring
+    # Paper positions are only valid for the current run; stale ones block new trades.
+    import sqlite3 as _sqlite3
+    try:
+        _conn = _sqlite3.connect("poly_engine.db")
+        _conn.execute("UPDATE positions SET status='closed' WHERE status='open'")
+        _conn.commit()
+        stale = _conn.execute("SELECT changes()").fetchone()[0]
+        _conn.close()
+        if stale:
+            logger.info(f"restore_state: closed {stale} stale positions from previous session")
+    except Exception as _e:
+        logger.debug(f"stale position cleanup failed: {_e}")
 
     # Restore open positions
     open_positions = load_open_positions(account.id)

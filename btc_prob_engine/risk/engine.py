@@ -33,7 +33,7 @@ class RiskParams:
     daily_loss_limit_pct: float = 5.0   # daily stop-out %
     var_confidence:      float = 0.95   # VaR confidence level
     vol_scale_cap:       float = 3.0    # max vol-scaling multiplier
-    min_confidence:      float = 0.05   # ✅ FIX #3: lowered from 0.15 → 0.05 (paper trading)
+    min_confidence:      float = 0.03   # ✅ lowered from 0.05 → 0.03 (heuristic proxy trades at lower conviction)
 
 
 # ── Risk Score ───────────────────────────────────────────────────────────────
