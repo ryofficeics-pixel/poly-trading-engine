@@ -33,7 +33,7 @@ class RiskParams:
     daily_loss_limit_pct: float = 5.0   # daily stop-out %
     var_confidence:      float = 0.95   # VaR confidence level
     vol_scale_cap:       float = 3.0    # max vol-scaling multiplier
-    min_confidence:      float = 0.15   # min model confidence to trade
+    min_confidence:      float = 0.05   # ✅ FIX #3: lowered from 0.15 → 0.05 (paper trading)
 
 
 # ── Risk Score ───────────────────────────────────────────────────────────────
@@ -191,6 +191,8 @@ def classify_vol_regime(current_vol: float, vol_history: List[float]) -> str:
     Compare current GARCH vol vs rolling distribution.
     Pattern: arch volatility forecast → regime classification.
     Returns: LOW | NORMAL | HIGH | EXTREME
+    
+    ✅ FIX #3: Relaxed thresholds for paper trading (BTC often 100-200% vol)
     """
     if not vol_history or len(vol_history) < 10:
         return "NORMAL"
@@ -198,11 +200,11 @@ def classify_vol_regime(current_vol: float, vol_history: List[float]) -> str:
     n           = len(sorted_vols)
     p25  = sorted_vols[n // 4]
     p75  = sorted_vols[3 * n // 4]
-    p95  = sorted_vols[int(n * 0.95)]
+    p99  = sorted_vols[int(n * 0.99)]  # Changed from p95 to p99
 
     if current_vol < p25:     return "LOW"
     elif current_vol < p75:   return "NORMAL"
-    elif current_vol < p95:   return "HIGH"
+    elif current_vol < p99:   return "HIGH"      # More lenient
     else:                     return "EXTREME"
 
 

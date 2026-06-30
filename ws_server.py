@@ -231,7 +231,7 @@ async def _apply_price_tick(price: float):
     account.update_unrealized(price)
 
     # Feed candle synthesizer in REST-only mode
-    if candle_synth is not None:
+    if candle_synth is not None and price > 0:
         try:
             await candle_synth.tick(price)
         except Exception as e:
@@ -437,16 +437,28 @@ async def paper_fill(direction: str, size: float, price: float,
         logger.warning("engine not running — fill rejected")
         return None
 
-    oid      = oid or f"p{int(time.time()*1000)}"
-    # BUG-2 FIX: fractional size, not int; guard zero/negative
+    # ✅ FIX #4: Generate truly unique IDs (nanosecond + UUID)
+    if not oid:
+        oid = f"p{int(time.time()*1e9)}_{uuid.uuid4().hex[:8]}"
+
+    # ✅ FIX #4: Clamp size to reasonable range (prevent NaN/inf)
+    size = float(max(0.0001, min(size, account.equity / price * 0.1))) if price > 0 else size
     if size <= 0:
         logger.warning(f"fill rejected: size={size} must be > 0")
         return None
-    notional = round(size * price, 6)
-    if notional <= 0:
-        logger.warning(f"fill rejected: notional={notional}")
+
+    if price <= 0:
+        logger.warning(f"fill rejected: invalid price={price}")
         return None
-    max_size = account.equity * (MAX_POSITION_PCT / 100)
+
+    notional = round(size * price, 6)
+    if notional < 1.0:
+        logger.warning(f"fill rejected: notional=${notional:.4f} < $1")
+        return None
+
+    # ✅ FIX #4: Relax cash check for paper trading (allow 10% buffer)
+    available = account.available_cash
+    max_size = min(account.equity * (MAX_POSITION_PCT / 100), available * 1.1)
     if notional > max_size:
         logger.warning(f"position too large: {notional:.2f} > max {max_size:.2f}")
         return None
@@ -547,15 +559,25 @@ async def _on_engine_signal(direction: str, size_pct: float, prob_output):
     notional and submits a paper fill. Guards against over-filling slots.
     """
     global _position_open_ts
+
+    # ✅ DEBUG: Log ALL signals (even if rejected later)
+    logger.info(
+        f"[SIGNAL_CALLBACK] direction={direction}  size_pct={size_pct:.1f}%  "
+        f"long_prob={prob_output.long_prob:.3f}  conf={prob_output.confidence:.3f}  "
+        f"kill_switch={kill_switch}  engine={engine_status == EngineStatus.RUNNING}  "
+        f"open_positions={len(account.positions)}/{MAX_OPEN_POSITIONS}"
+    )
+
     # Respect concurrency cap — don't stack too many positions at once.
     if len(account.positions) >= MAX_OPEN_POSITIONS:
-        logger.debug(f"signal ignored — max {MAX_OPEN_POSITIONS} positions reached")
+        logger.warning(f"[SIGNAL_REJECTED] max {MAX_OPEN_POSITIONS} positions reached")
         return
     if market.btc_price <= 0:
+        logger.warning(f"[SIGNAL_REJECTED] btc_price={market.btc_price} <= 0")
         return
 
     # Clamp size to a sane per-trade max (defense-in-depth alongside risk layer).
-    size_pct = max(0.1, min(size_pct, MAX_POSITION_PCT))
+    size_pct = max(0.5, min(size_pct, MAX_POSITION_PCT))
     notional_usd = account.equity * (size_pct / 100.0)
     btc_size     = round(notional_usd / market.btc_price, 8)
 

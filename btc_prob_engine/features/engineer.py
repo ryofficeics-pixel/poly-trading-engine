@@ -409,9 +409,10 @@ class FeatureEngineer:
         c5m  = list(self.ring.candles_5m)
         c1h  = list(self.ring.candles_1h)
 
-        has_1m = len(c1m) >= 30
-        has_5m = len(c5m) >= 30
-        has_1h = len(c1h) >= 20
+        # ✅ FIX #2: Reduce starvation threshold (30 min → 5 min for first signal)
+        has_1m = len(c1m) >= 5
+        has_5m = len(c5m) >= 5
+        has_1h = len(c1h) >= 3
 
         features["n_candles_1m"] = float(len(c1m))
         features["n_candles_5m"] = float(len(c5m))
