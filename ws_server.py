@@ -354,6 +354,12 @@ async def _fallback_poll_feed():
         # Try REST sources in priority order.
         price = None
         sources = [
+            ("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", 
+             lambda d: float(d["result"]["XXBTZUSD"]["c"][0]), "kraken"),
+            ("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+             lambda d: float(d["price"]), "binance-rest"),
+            ("https://api.coinbase.com/v2/prices/BTC-USD/spot",
+             lambda d: float(d["data"]["amount"]), "coinbase"),
             (_COINGECKO_URL,   lambda d: float(d["bitcoin"]["usd"]),         "coingecko"),
             (_COINPAPRIKA_URL, lambda d: float(d["quotes"]["USD"]["price"]), "coinpaprika"),
         ]
