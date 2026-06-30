@@ -409,9 +409,13 @@ class FeatureEngineer:
         c5m  = list(self.ring.candles_5m)
         c1h  = list(self.ring.candles_1h)
 
-        has_1m = len(c1m) >= 30
-        has_5m = len(c5m) >= 30
-        has_1h = len(c1h) >= 20
+        # Lowered from 30/30/20 — at 30/30 the 5m gate alone needs 150 minutes
+        # of uptime before rsi14_5m (and therefore tf_alignment) exists at all,
+        # and the proxy model's rsi_5m/rsi_1h inputs silently default to 0.5
+        # (neutral) until then, suppressing nearly every signal for hours.
+        has_1m = len(c1m) >= 15
+        has_5m = len(c5m) >= 10
+        has_1h = len(c1h) >= 5
 
         features["n_candles_1m"] = float(len(c1m))
         features["n_candles_5m"] = float(len(c5m))

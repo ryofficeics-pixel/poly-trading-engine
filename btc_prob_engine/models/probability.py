@@ -138,12 +138,24 @@ class FeatureMatrix:
 
     def latest_x(self) -> Optional[Tuple[np.ndarray, List[str]]]:
         """Single-row inference vector."""
-        if not self._rows or not self._col_order:
+        if not self._rows:
             return None
-        row  = self._rows[-1]
-        cols = self._col_order
-        x    = np.array([[row.get(c, 0.0) for c in cols]], dtype=np.float32)
-        x    = np.nan_to_num(x, nan=0.0)
+        row = self._rows[-1]
+        # _col_order is only populated by to_numpy(), which the live
+        # inference path (BTCProbabilityEngine.predict) never calls. Worse,
+        # reusing a previously-cached _col_order locks inference to whatever
+        # (possibly sparse) feature set existed on the FIRST call — e.g. a
+        # cold-start row with only extract_ts/price/n_candles_* present —
+        # silently dropping rsi14_1m, bb_pct_b_1m, regime_*, etc. from every
+        # subsequent prediction for the lifetime of the process. Always
+        # derive columns from the current row so newly-available features
+        # (once enough candles exist) actually reach the model.
+        cols = sorted(k for k in row.keys()
+                      if k not in ("extract_ts", "price",
+                                    "n_candles_1m", "n_candles_5m", "n_candles_1h"))
+        self._col_order = cols
+        x = np.array([[row.get(c, 0.0) for c in cols]], dtype=np.float32)
+        x = np.nan_to_num(x, nan=0.0)
         return x, cols
 
     def add_price_labels(self, prices: List[float], horizon: int = 5,

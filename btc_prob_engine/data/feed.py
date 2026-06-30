@@ -137,6 +137,15 @@ class DataRing:
             return self.trades[-1].price
         if self.orderbook:
             return self.orderbook.mid
+        # REST-only / candle-synthesizer mode never pushes individual trades —
+        # only closed candles. Without this fallback, latest_price() always
+        # returns 0.0 here, which makes FeatureEngineer.extract() bail out
+        # immediately on every call (see engineer.py: `if price == 0: return`),
+        # so features — and therefore signals — never fire even after hours
+        # of uptime.
+        for ring in (self.candles_1m, self.candles_5m, self.candles_1h):
+            if ring:
+                return ring[-1].close
         return 0.0
 
     def vwap(self, window: int = 100) -> float:
