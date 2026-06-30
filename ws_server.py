@@ -1038,6 +1038,11 @@ def restore_state():
             opened_at=p["opened_at"], account_id=account.id, session_id=account.session_id,
         )
         account.positions[pos.id] = pos
+        # ✅ FIX: Register restored positions in _position_open_ts
+        # Use a very old timestamp so time-based exit fires quickly if stale.
+        # Positions from the current session will be refreshed when found in logs.
+        if pos.id not in _position_open_ts:
+            _position_open_ts[pos.id] = time.time() - MAX_HOLD_MINUTES * 60
 
     # Restore counters from trades table
     trades = load_trades(account.id, limit=10000)
